@@ -24,7 +24,6 @@ import com.google.common.cache.CacheBuilder;
 import com.google.common.cache.RemovalListener;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
-import com.google.common.collect.ImmutableSet;
 import org.openqa.selenium.Capabilities;
 import org.openqa.selenium.ImmutableCapabilities;
 import org.openqa.selenium.NoSuchSessionException;
@@ -32,12 +31,17 @@ import org.openqa.selenium.PersistentCapabilities;
 import org.openqa.selenium.WebDriverException;
 import org.openqa.selenium.concurrent.Regularly;
 import org.openqa.selenium.events.EventBus;
-import org.openqa.selenium.grid.component.HealthCheck;
+import org.openqa.selenium.grid.data.Active;
 import org.openqa.selenium.grid.data.CreateSessionRequest;
 import org.openqa.selenium.grid.data.CreateSessionResponse;
+import org.openqa.selenium.grid.data.NodeDrainComplete;
+import org.openqa.selenium.grid.data.NodeId;
 import org.openqa.selenium.grid.data.NodeStatus;
 import org.openqa.selenium.grid.data.Session;
+import org.openqa.selenium.grid.data.Slot;
+import org.openqa.selenium.grid.data.SlotId;
 import org.openqa.selenium.grid.node.ActiveSession;
+import org.openqa.selenium.grid.node.HealthCheck;
 import org.openqa.selenium.grid.node.Node;
 import org.openqa.selenium.grid.node.SessionFactory;
 import org.openqa.selenium.internal.Require;
@@ -47,6 +51,9 @@ import org.openqa.selenium.json.Json;
 import org.openqa.selenium.remote.SessionId;
 import org.openqa.selenium.remote.http.HttpRequest;
 import org.openqa.selenium.remote.http.HttpResponse;
+import org.openqa.selenium.remote.tracing.AttributeKey;
+import org.openqa.selenium.remote.tracing.EventAttribute;
+import org.openqa.selenium.remote.tracing.EventAttributeValue;
 import org.openqa.selenium.remote.tracing.Span;
 import org.openqa.selenium.remote.tracing.Status;
 import org.openqa.selenium.remote.tracing.Tracer;
@@ -58,23 +65,27 @@ import java.net.URI;
 import java.net.URISyntaxException;
 import java.time.Clock;
 import java.time.Duration;
+import java.time.Instant;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.TreeMap;
 import java.util.UUID;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.logging.Logger;
 import java.util.stream.Collectors;
 
 import static com.google.common.collect.ImmutableSet.toImmutableSet;
-import static java.util.stream.Collectors.groupingBy;
-import static java.util.stream.Collectors.summingInt;
 import static org.openqa.selenium.grid.data.SessionClosedEvent.SESSION_CLOSED;
 import static org.openqa.selenium.grid.node.CapabilityResponseEncoder.getEncoder;
 import static org.openqa.selenium.remote.HttpSessionId.getSessionId;
 import static org.openqa.selenium.remote.RemoteTags.CAPABILITIES;
+import static org.openqa.selenium.remote.RemoteTags.CAPABILITIES_EVENT;
 import static org.openqa.selenium.remote.RemoteTags.SESSION_ID;
+import static org.openqa.selenium.remote.RemoteTags.SESSION_ID_EVENT;
 import static org.openqa.selenium.remote.http.Contents.asJson;
 import static org.openqa.selenium.remote.http.Contents.string;
 import static org.openqa.selenium.remote.http.HttpMethod.DELETE;
@@ -93,6 +104,7 @@ public class LocalNode extends Node {
   private final Cache<SessionId, TemporaryFilesystem> tempFileSystems;
   private final Regularly regularly;
   private final String registrationSecret;
+  private AtomicInteger pendingSessions = new AtomicInteger();
 
   private LocalNode(
     Tracer tracer,
@@ -105,7 +117,7 @@ public class LocalNode extends Node {
     Duration sessionTimeout,
     List<SessionSlot> factories,
     String registrationSecret) {
-    super(tracer, UUID.randomUUID(), uri);
+    super(tracer, new NodeId(UUID.randomUUID()), uri);
 
     this.bus = Require.nonNull("Event bus", bus);
 
@@ -148,6 +160,13 @@ public class LocalNode extends Node {
         this.stop(event.getData(SessionId.class));
       } catch (NoSuchSessionException ignore) {
       }
+      if (this.isDraining()) {
+        int done = pendingSessions.decrementAndGet();
+        if (done <= 0) {
+          LOG.info("Firing node drain complete message");
+          bus.fire(new NodeDrainComplete(this.getId()));
+        }
+      }
     });
   }
 
@@ -172,44 +191,82 @@ public class LocalNode extends Node {
     Require.nonNull("Session request", sessionRequest);
 
     try (Span span = tracer.getCurrentContext().createSpan("node.new_session")) {
+      Map<String, EventAttributeValue> attributeMap = new HashMap<>();
+      attributeMap
+          .put(AttributeKey.LOGGER_CLASS.getKey(), EventAttribute.setValue(getClass().getName()));
       LOG.fine("Creating new session using span: " + span);
-      span.setAttribute("session_count", getCurrentSessionCount());
+      attributeMap.put("session.request.capabilities",
+                       EventAttribute.setValue(sessionRequest.getCapabilities().toString()));
+      attributeMap.put("session.request.downstreamdialect",
+                       EventAttribute.setValue(sessionRequest.getDownstreamDialects().toString()));
+      int currentSessionCount = getCurrentSessionCount();
+      span.setAttribute("current.session.count", currentSessionCount);
+      attributeMap.put("current.session.count", EventAttribute.setValue(currentSessionCount));
 
       if (getCurrentSessionCount() >= maxSessionCount) {
         span.setAttribute("error", true);
-        span.setStatus(Status.RESOURCE_EXHAUSTED.withDescription("Max session count reached"));
+        span.setStatus(Status.RESOURCE_EXHAUSTED);
+        attributeMap.put("max.session.count", EventAttribute.setValue(maxSessionCount));
+        span.addEvent("Max session count reached", attributeMap);
+        return Optional.empty();
+      }
+      if (isDraining()) {
+        span.setStatus(Status.UNAVAILABLE.withDescription("The node is draining. Cannot accept new sessions."));
         return Optional.empty();
       }
 
-      Optional<ActiveSession> possibleSession = Optional.empty();
-      SessionSlot slot = null;
-      for (SessionSlot factory : factories) {
-        if (!factory.isAvailable() || !factory.test(sessionRequest.getCapabilities())) {
-          continue;
-        }
+      // Identify possible slots to use as quickly as possible to enable concurrent session starting
+      SessionSlot slotToUse = null;
+      synchronized(factories) {
+        for (SessionSlot factory : factories) {
+          if (!factory.isAvailable() || !factory.test(sessionRequest.getCapabilities())) {
+            continue;
+          }
 
-        possibleSession = factory.apply(sessionRequest);
-        if (possibleSession.isPresent()) {
-          slot = factory;
+          factory.reserve();
+          slotToUse = factory;
           break;
         }
       }
 
-      if (!possibleSession.isPresent()) {
+      if (slotToUse == null) {
         span.setAttribute("error", true);
-        span.setStatus(Status.NOT_FOUND.withDescription(
-            "No slots available for capabilities " + sessionRequest.getCapabilities()));
+        span.setStatus(Status.NOT_FOUND);
+        span.addEvent("No slot matched capabilities ", attributeMap);
+        return Optional.empty();
+      }
+
+      Optional<ActiveSession> possibleSession = slotToUse.apply(sessionRequest);
+
+      if (!possibleSession.isPresent()) {
+        slotToUse.release();
+        span.setAttribute("error", true);
+        span.setStatus(Status.NOT_FOUND);
+        span.addEvent("No slots available for capabilities ", attributeMap);
         return Optional.empty();
       }
 
       ActiveSession session = possibleSession.get();
-      currentSessions.put(session.getId(), slot);
+      currentSessions.put(session.getId(), slotToUse);
 
-      SESSION_ID.accept(span, session.getId());
-      CAPABILITIES.accept(span, session.getCapabilities());
-      span.setAttribute("session.downstream.dialect", session.getDownstreamDialect().toString());
-      span.setAttribute("session.upstream.dialect", session.getUpstreamDialect().toString());
-      span.setAttribute("session.uri", session.getUri().toString());
+      SessionId sessionId = session.getId();
+      Capabilities caps = session.getCapabilities();
+      SESSION_ID.accept(span, sessionId);
+      CAPABILITIES.accept(span, caps);
+      SESSION_ID_EVENT.accept(attributeMap, sessionId);
+      CAPABILITIES_EVENT.accept(attributeMap, caps);
+      String downstream = session.getDownstreamDialect().toString();
+      String upstream = session.getUpstreamDialect().toString();
+      String sessionUri = session.getUri().toString();
+      span.setAttribute(AttributeKey.DOWNSTREAM_DIALECT.getKey(), downstream);
+      span.setAttribute(AttributeKey.UPSTREAM_DIALECT.getKey(), upstream);
+      span.setAttribute(AttributeKey.SESSION_URI.getKey(), sessionUri);
+
+      attributeMap.put(AttributeKey.DOWNSTREAM_DIALECT.getKey(), EventAttribute.setValue(downstream));
+      attributeMap.put(AttributeKey.UPSTREAM_DIALECT.getKey(), EventAttribute.setValue(upstream));
+      attributeMap.put(AttributeKey.SESSION_URI.getKey(), EventAttribute.setValue(sessionUri));
+
+      span.addEvent("Session created by node", attributeMap);
 
       // The session we return has to look like it came from the node, since we might be dealing
       // with a webdriver implementation that only accepts connections from localhost
@@ -343,7 +400,7 @@ public class LocalNode extends Node {
     }
   }
 
-  private void killSession(SessionSlot slot) {
+  private void  killSession(SessionSlot slot) {
     currentSessions.invalidate(slot.getSession().getId());
     // Attempt to stop the session
     if (!slot.isAvailable()) {
@@ -353,22 +410,33 @@ public class LocalNode extends Node {
 
   @Override
   public NodeStatus getStatus() {
-    Map<Capabilities, Integer> stereotypes = factories.stream()
-      .collect(groupingBy(SessionSlot::getStereotype, summingInt(caps -> 1)));
+    Set<Slot> slots = factories.stream()
+      .map(slot -> {
+        Optional<Active> session = Optional.empty();
+        if (!slot.isAvailable()) {
+          ActiveSession activeSession = slot.getSession();
+          session = Optional.of(
+            new Active(
+              slot.getStereotype(),
+              activeSession.getId(),
+              activeSession.getCapabilities(),
+              activeSession.getStartTime()));
+        }
 
-    ImmutableSet<NodeStatus.Active> activeSessions = currentSessions.asMap().values().stream()
-      .map(slot -> new NodeStatus.Active(
-        slot.getStereotype(),
-        slot.getSession().getId(),
-        slot.getSession().getCapabilities()))
+        return new Slot(
+          new SlotId(getId(), slot.getId()),
+          slot.getStereotype(),
+          Instant.EPOCH,
+          session);
+      })
       .collect(toImmutableSet());
 
     return new NodeStatus(
       getId(),
       externalUri,
       maxSessionCount,
-      stereotypes,
-      activeSessions,
+      slots,
+      isDraining(),
       registrationSecret);
   }
 
@@ -377,11 +445,24 @@ public class LocalNode extends Node {
     return healthCheck;
   }
 
+  @Override
+  public void drain() {
+    draining = true;
+    int currentSessionCount = getCurrentSessionCount();
+    if (currentSessionCount == 0) {
+      LOG.info("Firing node drain complete message");
+      bus.fire(new NodeDrainComplete(this.getId()));
+    } else {
+      pendingSessions.set(currentSessionCount);
+    }
+  }
+
   private Map<String, Object> toJson() {
     return ImmutableMap.of(
       "id", getId(),
       "uri", externalUri,
       "maxSessions", maxSessionCount,
+      "draining", isDraining(),
       "capabilities", factories.stream()
         .map(SessionSlot::getStereotype)
         .collect(Collectors.toSet()));
